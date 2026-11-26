@@ -506,6 +506,18 @@ class Ventana(QMainWindow):
         ruta, _ = QFileDialog.getOpenFileName(self, "Abrir cronograma", self.ajustes.value("ultimo", ""), "Excel (*.xlsx)")
         if not ruta:
             return
+        if core.es_project(ruta):                      # exportación a Excel de Microsoft Project
+            try:
+                tareas, cal, aviso = core.leer_project(ruta)
+            except Exception as e:
+                QMessageBox.critical(self, "No se pudo leer el archivo de Project", str(e))
+                return
+            QMessageBox.information(self, "Importado desde Project", aviso + "\n\nRevisa el calendario en «Calendario…» "
+                                    "antes de replanificar. Al guardar se crea un Excel nuevo; el original no se modifica.")
+            self.cal, self.tareas, self.ruta, self.sucio = cal, tareas, None, True
+            self.ajustes.setValue("calendario", cal_a_json(cal))
+            self.refrescar()
+            return
         try:
             tareas, cal = core.leer_excel(ruta)
         except Exception as e:

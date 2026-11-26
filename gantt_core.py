@@ -316,6 +316,133 @@ def leer_excel(ruta):
     return tareas, cal
 
 
+# ---------------------------------------------------------------- Importar desde Microsoft Project (Excel)
+MESES = {m: i + 1 for i, m in enumerate(["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                                           "agosto", "septiembre", "octubre", "noviembre", "diciembre"])}
+
+
+def es_project(ruta):
+    """True si el Excel es una exportación de Project (hoja «Tabla_Tareas»)."""
+    try:
+        return "Tabla_Tareas" in load_workbook(ruta, read_only=True).sheetnames
+    except Exception:
+        return False
+
+
+def _fecha_es(v):
+    """'23 noviembre 2026 09:00 AM' → date. También acepta fechas reales de Excel."""
+    if isinstance(v, (dt.date, dt.datetime)):
+        return v.date() if isinstance(v, dt.datetime) else v
+    m = re.match(r"\s*(\d{1,2})\s+([a-záéíóú]+)\.?\s+(\d{4})", str(v or "").lower())
+    if m and m.group(2) in MESES:
+        return dt.date(int(m.group(3)), MESES[m.group(2)], int(m.group(1)))
+    return parse_fecha(v)
+
+
+def _dur_dias(v):
+    """'20 días' / '1 día' / '2 sem' → días hábiles. Unidades distintas se rechazan (no se adivinan)."""
+    m = re.match(r"\s*([\d.,]+)\s*([a-záéíóú]+)", str(v or "").lower())
+    if not m:
+        raise ValueError(f"Duración no reconocida: «{v}»")
+    n, u = float(m.group(1).replace(",", ".")), m.group(2)
+    if u.startswith("d"):
+        return max(1, round(n))
+    if u.startswith("sem") or u == "s":
+        return max(1, round(n * 5))
+    raise ValueError(f"Duración en unidad no soportada: «{v}» (usa días en Project).")
+
+
+def leer_project(ruta):
+    """Lee la exportación a Excel de Microsoft Project (Tabla_Tareas, Tabla_asignación).
+    Devuelve (tareas, calendario inferido, texto de aviso para mostrar al usuario).
+    Los IDs se generan por esquema (1, 1-1, 1-1-1…); el Id original de Project queda en Notas.
+    Avance = promedio de «% trabajo completado» de las asignaciones, ponderado por horas de trabajo."""
+    wb = load_workbook(ruta, data_only=True)
+    ws = wb["Tabla_Tareas"]
+    filas = list(ws.iter_rows(values_only=True))
+    cab = {_norm(c): i for i, c in enumerate(filas[0])}
+    for k in ("id", "nombre", "duracion", "comienzo", "fin", "niveldeesquema"):
+        if k not in cab:
+            raise ValueError(f"Falta la columna «{k}» en la hoja Tabla_Tareas.")
+    g = lambda r, k: r[cab[k]] if k in cab and cab[k] < len(r) else None
+    datos = [r for r in filas[1:] if g(r, "id") not in (None, "")]
+    # asignaciones
+    recursos, avance = {}, {}
+    if "Tabla_asignación" in wb.sheetnames or "Tabla_asignacion" in wb.sheetnames:
+        wa = wb["Tabla_asignación" if "Tabla_asignación" in wb.sheetnames else "Tabla_asignacion"]
+        fa = list(wa.iter_rows(values_only=True))
+        ca = {_norm(c): i for i, c in enumerate(fa[0])}
+        for r in fa[1:]:
+            nom = str(r[ca.get("nombredetarea", 0)] or "").strip()
+            rec = str(r[ca.get("nombredelrecurso", 1)] or "").strip()
+            pct = r[ca["trabajocompletado"]] if "trabajocompletado" in ca else None
+            hrs = r[ca["trabajo"]] if "trabajo" in ca else None
+            try:
+                pct = float(str(pct).replace(",", ".").replace("%", "")); pct = pct * 100 if pct <= 1 else pct
+            except (TypeError, ValueError):
+                pct = 0.0
+            try:
+                hrs = float(re.sub(r"[^\d.,]", "", str(hrs)).replace(",", ".") or 0)
+            except ValueError:
+                hrs = 0.0
+            if rec:
+                recursos.setdefault(nom, [])
+                if rec not in recursos[nom]:
+                    recursos[nom].append(rec)
+            avance.setdefault(nom, []).append((hrs, pct))
+    # IDs por esquema
+    niveles = [int(float(g(r, "niveldeesquema"))) for r in datos]
+    cont, ids, pila = [0] * 12, [], []
+    for n in niveles:
+        n = max(1, min(n, 11))
+        cont[n] += 1
+        for k in range(n + 1, 12):
+            cont[k] = 0
+        ids.append("-".join(str(cont[k]) for k in range(1, n + 1)))
+    por_pid = {str(int(float(g(r, "id")))): ids[i] for i, r in enumerate(datos)}
+    # horas por día inferidas (trabajo / duración, 100 % de unidades)
+    razones, tareas, lags = [], [], 0
+    for i, r in enumerate(datos):
+        resumen = i + 1 < len(datos) and niveles[i + 1] > niveles[i]
+        nombre = str(g(r, "nombre") or "").strip()
+        dur = _dur_dias(g(r, "duracion"))
+        preds = []
+        for tok in re.split(r"[;,]", str(g(r, "predecesoras") or "")):
+            m = re.match(r"\s*(\d+)\s*(FC|CC|FF|CF|FS|SS)?\s*(.*)$", tok.upper())
+            if m and m.group(1) in por_pid:
+                preds.append(por_pid[m.group(1)])
+                lags += bool(m.group(2) not in (None, "FC", "FS") or m.group(3))
+        a = avance.get(nombre, [])
+        th = sum(h for h, _ in a)
+        av = (sum(h * p for h, p in a) / th) if th else (sum(p for _, p in a) / len(a) if a else 0.0)
+        if not resumen and a and th and dur:
+            razones.append(round(th / dur / max(1, len(a)), 1))
+        tareas.append(Tarea(ids[i], nombre, "/".join(recursos.get(nombre, [])), _fecha_es(g(r, "comienzo")), dur,
+                            max(0.0, min(100.0, av)), ",".join(preds), False,
+                            (f"Id Project: {int(float(g(r, 'id')))}" + (f" · {g(r, 'notas')}" if g(r, "notas") else ""))))
+    # calendario: se prueba qué días de la semana reproducen las fechas de fin de Project
+    hojas = [(i, resumen) for i, resumen in enumerate(
+        [i + 1 < len(datos) and niveles[i + 1] > niveles[i] for i in range(len(datos))]) if not resumen]
+    mejor = None
+    for dias in ((0, 1, 2, 3, 4), (0, 1, 2, 3, 4, 5), tuple(range(7))):
+        c = Calendario(8, dias)
+        ok = sum(1 for i, _ in hojas if _fecha_es(datos[i][cab["fin"]]) == c.sumar(tareas[i].inicio, tareas[i].dur))
+        if mejor is None or ok > mejor[0]:
+            mejor = (ok, dias)
+    h = sorted(razones)[len(razones) // 2] if razones else 8.0
+    cal = Calendario(h, mejor[1])
+    avisos = [f"Importadas {len(tareas)} tareas desde Project ({len(hojas)} con trabajo propio, "
+              f"{len(tareas) - len(hojas)} resúmenes).",
+              f"Calendario inferido: {cal.resumen()} — coinciden {mejor[0]} de {len(hojas)} fechas de fin; "
+              + ("sin feriados (Project no los informa en la exportación)." if mejor[0] == len(hojas)
+                 else "las demás difieren, probablemente por feriados o excepciones: agrégalos en «Calendario…»."),
+              "Horas por día = trabajo ÷ duración de las asignaciones." if razones
+              else "Horas por día no deducibles: se usan 8 h, ajústalo en «Calendario…»."]
+    if lags:
+        avisos.append(f"{lags} predecesora(s) con tipo o desfase distinto de Fin→Inicio: se importaron como Fin→Inicio sin desfase.")
+    return tareas, cal, "\n".join(avisos)
+
+
 # ---------------------------------------------------------------- Microsoft Project
 PROJECT_COLS = ["Nivel de esquema", "Modo de tarea", "Nombre de tarea", "Duración", "Comienzo", "Fin",
                 "Predecesoras", "Nombres de los recursos"]

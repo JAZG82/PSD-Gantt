@@ -14,6 +14,9 @@ También se generan ejecutables (Mac Apple Silicon y Windows) con GitHub Actions
 ## Al abrir
 Pregunta si quieres **comenzar desde cero**, **leer un archivo Excel** o ver un ejemplo (datos ficticios). Desde cero y al leer un Excel sin hoja «Calendario» se pide el calendario de trabajo.
 
+## Importar desde Microsoft Project
+«Abrir Excel…» reconoce la exportación de Project (Archivo → Exportar → Excel, hoja «Tabla_Tareas»): lee tareas, duración en días, comienzo, predecesoras, nivel de esquema y notas; toma los recursos y el **% de avance** (ponderado por horas de trabajo) de «Tabla_asignación». Genera IDs por esquema (1, 1-1, 1-1-1…; el Id original queda en Notas) e **infiere el calendario** (días de la semana y horas por día) comprobando que reproduce las fechas de fin de Project. Limitaciones: predecesoras con tipo distinto de Fin→Inicio o con desfase se importan como Fin→Inicio sin desfase; feriados y excepciones de calendario de Project no vienen en la exportación (agrégalos en «Calendario…»); un `.mpp` directo no se puede leer.
+
 ## Calendario de trabajo (global)
 Botón **Calendario…**: horas por día, días de la semana que se trabaja y fechas sin trabajo (feriados, detenciones; se pueden agregar rangos). Atajos: Lun–Vie 8 h, Lun–Sáb 10 h, todos los días 12 h (turno 12x12). Se guarda dentro del Excel (hoja «Calendario») y los días sin trabajo se sombrean en la Gantt.
 
