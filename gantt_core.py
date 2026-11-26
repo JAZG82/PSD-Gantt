@@ -13,19 +13,36 @@ DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
 
 class Calendario:
-    """Calendario global: horas por día, días de la semana que se trabaja y fechas sin trabajo.
+    """Jornada de un recurso (o de la planta): horas por día, días de la semana que se trabaja
+    (o un ciclo rotativo N días trabaja / M libres) y fechas sin trabajo propias.
     Tratar como inmutable (el caché de fechas libres se arma al crear)."""
 
-    def __init__(self, horas=8.0, dias=(0, 1, 2, 3, 4), libres=()):
+    def __init__(self, horas=8.0, dias=(0, 1, 2, 3, 4), libres=(), ciclo=None):
         self.horas = float(horas)
         self.dias = tuple(sorted(set(dias)))
         self.libres = sorted(libres, key=lambda x: x[0])      # [(fecha, motivo)]
         self._s = {f for f, _ in self.libres}
-        if not self.dias:
+        self.ciclo = tuple(ciclo) if ciclo else None           # (días trabaja, días libres, fecha de inicio del ciclo)
+        if self.ciclo:
+            n, m, f = self.ciclo
+            if n < 1 or m < 0 or not f:
+                raise ValueError("Ciclo no válido: días de trabajo ≥ 1, días libres ≥ 0 y fecha de inicio.")
+        elif not self.dias:
             raise ValueError("El calendario necesita al menos un día laboral por semana.")
 
-    def es_habil(self, d):
-        return d.weekday() in self.dias and d not in self._s
+    def trabaja(self, d):
+        """¿Este calendario trabaja el día d? (patrón de semana o ciclo, menos sus fechas libres)."""
+        if d in self._s:
+            return False
+        if self.ciclo:
+            n, m, f = self.ciclo
+            return (d - f).days % (n + m) < n
+        return d.weekday() in self.dias
+
+    es_habil = trabaja
+
+    def de(self, t=None):
+        return self
 
     def desde(self, d):
         """Primer día hábil igual o posterior a d."""
@@ -48,13 +65,85 @@ class Calendario:
         """Días hábiles entre ini y fin, ambos incluidos (mínimo 1)."""
         n, d = 0, ini
         while d <= fin:
-            n += d.weekday() in self.dias and d not in self._s
+            n += self.es_habil(d)
             d += dt.timedelta(days=1)
         return max(1, n)
 
+    def horas_dia(self, d):
+        return self.horas if self.es_habil(d) else 0.0
+
+    def horas_rango(self, ini, fin):
+        h, d = 0.0, ini
+        while d <= fin:
+            h += self.horas_dia(d)
+            d += dt.timedelta(days=1)
+        return h
+
+    def patron(self):
+        if self.ciclo:
+            n, m, f = self.ciclo
+            return f"ciclo {n}x{m} desde {fmt(f)}"
+        return ",".join(DIAS[i] for i in self.dias)
+
     def resumen(self):
-        return (f"{self.horas:g} h/día · " + ",".join(DIAS[i] for i in self.dias)
+        return (f"{self.horas:g} h/día · {self.patron()}"
                 + (f" · {len(self.libres)} día(s) sin trabajo" if self.libres else ""))
+
+
+class _CalTarea:
+    """Calendario efectivo de una tarea: los días no laborales globales (feriados, detenciones) aplican
+    a todos; con varios recursos la tarea avanza los días en que trabaja AL MENOS uno."""
+
+    def __init__(self, base, cals):
+        self.base, self.cals = base, cals
+
+    def es_habil(self, d):
+        return d not in self.base._s and any(c.trabaja(d) for c in self.cals)
+
+    desde = Calendario.desde
+    sumar = Calendario.sumar
+    contar = Calendario.contar
+    horas_rango = Calendario.horas_rango
+
+    def horas_dia(self, d):
+        if d in self.base._s:
+            return 0.0
+        return sum(c.horas for c in self.cals if c.trabaja(d))
+
+
+def nombres_recurso(texto):
+    """'Mecánica/Eléctrica' → ['Mecánica', 'Eléctrica'] (separadores: / ; ,)."""
+    return [x.strip() for x in re.split(r"[/;,]", texto or "") if x.strip()]
+
+
+class Calendarios:
+    """Calendario global (base: jornada y feriados de toda la planta) + calendarios propios por recurso.
+    Un recurso sin calendario propio trabaja según el patrón de la base. Se comporta como el calendario
+    base en todo lo que no dependa de la tarea."""
+
+    def __init__(self, base=None, recursos=None):
+        self.base = base or Calendario()
+        self.recursos = dict(recursos or {})
+
+    def __getattr__(self, k):                 # horas, dias, libres, _s, es_habil, desde, sumar, contar…
+        if k in ("base", "recursos"):
+            raise AttributeError(k)
+        return getattr(self.base, k)
+
+    def de(self, t=None):
+        nombres = nombres_recurso(t.resp) if t is not None else []
+        cals = [self.recursos.get(n, self.base) for n in nombres] or [self.base]
+        if len(cals) == 1 and cals[0] is self.base:
+            return self.base
+        return _CalTarea(self.base, cals)
+
+    def resumen(self):
+        n = len(self.recursos)
+        return self.base.resumen() + (f" · {n} recurso(s) con calendario propio" if n else "")
+
+
+def como_calendarios(cal):
+    return cal if isinstance(cal, Calendarios) else Calendarios(cal)
 
 
 @dataclass
@@ -146,8 +235,10 @@ def calcular(tareas, cal):
             else:
                 r = (None, None, 0.0, horas)
         elif t.inicio:
-            ini = cal.desde(t.inicio)
-            r = (ini, cal.sumar(ini, t.dur), t.avance, max(1, t.dur) * cal.horas)
+            c = cal.de(t)
+            ini = c.desde(t.inicio)
+            fin = c.sumar(ini, t.dur)
+            r = (ini, fin, t.avance, c.horas_rango(ini, fin))
         else:
             r = (None, None, t.avance, 0.0)
         memo[id_] = r
@@ -184,6 +275,22 @@ def validar(tareas):
     return pr
 
 
+def sin_recurso(tareas):
+    """Tareas con trabajo propio (no resumen) sin recurso asignado: usan el calendario global."""
+    ids = {t.id for t in tareas}
+    padres = {padre_de(t.id, ids) for t in tareas}
+    return [t for t in tareas if t.id not in padres and not nombres_recurso(t.resp)]
+
+
+def recursos_en_uso(tareas):
+    out = []
+    for t in tareas:
+        for n in nombres_recurso(t.resp):
+            if n not in out:
+                out.append(n)
+    return out
+
+
 def _preds(t):
     return [x.strip() for x in re.split(r"[;,]", t.pred or "") if x.strip()]
 
@@ -202,8 +309,9 @@ def replanificar(tareas, cal):
             fines = [filas[p].fin for p in _preds(t) if p in filas and filas[p].fin]
             if not fines:
                 continue
-            nuevo = cal.desde(max(fines) + dt.timedelta(days=1))
-            if nuevo > cal.desde(t.inicio):
+            c = cal.de(t)
+            nuevo = c.desde(max(fines) + dt.timedelta(days=1))
+            if nuevo > c.desde(t.inicio):
                 t.inicio = nuevo
                 movidas.add(t.id)
                 cambio = True
@@ -214,6 +322,7 @@ def replanificar(tareas, cal):
 
 # ---------------------------------------------------------------- Excel
 def guardar_excel(tareas, cal, ruta):
+    cal = como_calendarios(cal)
     wb = Workbook()
     ws = wb.active
     ws.title = "Tareas"
@@ -235,16 +344,40 @@ def guardar_excel(tareas, cal, ruta):
     ws.cell(row=len(tareas) + 3, column=1,
             value="Fin y Horas se calculan con la hoja «Calendario». Filas resumen: valores calculados.")
     wc = wb.create_sheet("Calendario")
-    wc["A1"], wc["B1"] = "Horas por día", cal.horas
-    wc["A2"], wc["B2"] = "Días laborales", ",".join(DIAS[i] for i in cal.dias)
-    wc["A4"], wc["B4"] = "Días sin trabajo", "Motivo"
-    for c in (wc["A4"], wc["B4"]):
+    b = cal.base
+    wc["A1"], wc["B1"] = "Horas por día", b.horas
+    wc["A2"], wc["B2"] = "Días laborales", ",".join(DIAS[i] for i in b.dias)
+    wc["A3"], wc["B3"] = "Ciclo (trabaja;libres;inicio)", (
+        f"{b.ciclo[0]};{b.ciclo[1]};{fmt(b.ciclo[2])}" if b.ciclo else "")
+    wc["A5"], wc["B5"] = "Días sin trabajo (toda la planta)", "Motivo"
+    for c in (wc["A5"], wc["B5"]):
         c.font = Font(bold=True)
-    for f, m in cal.libres:
+    for f, m in b.libres:
         wc.append([f, m])
         wc.cell(row=wc.max_row, column=1).number_format = "dd-mm-yy"
-    wc.column_dimensions["A"].width = 18
+    wc.column_dimensions["A"].width = 34
     wc.column_dimensions["B"].width = 40
+    if cal.recursos:
+        wr = wb.create_sheet("Calendarios_Recursos")
+        wr.append(["Recurso", "Horas por día", "Días laborales", "Ciclo trabaja", "Ciclo libres", "Inicio ciclo"])
+        for c in wr[1]:
+            c.font = Font(bold=True)
+        for n, r in cal.recursos.items():
+            wr.append([n, r.horas, ",".join(DIAS[i] for i in r.dias),
+                       r.ciclo[0] if r.ciclo else None, r.ciclo[1] if r.ciclo else None,
+                       r.ciclo[2] if r.ciclo else None])
+            wr.cell(row=wr.max_row, column=6).number_format = "dd-mm-yy"
+        wl = wb.create_sheet("Libres_Recursos")
+        wl.append(["Recurso", "Fecha sin trabajo", "Motivo"])
+        for c in wl[1]:
+            c.font = Font(bold=True)
+        for n, r in cal.recursos.items():
+            for f, m in r.libres:
+                wl.append([n, f, m])
+                wl.cell(row=wl.max_row, column=2).number_format = "dd-mm-yy"
+        for ws_ in (wr, wl):
+            for letra, ancho in zip("ABCDEF", (26, 16, 24, 14, 12, 14)):
+                ws_.column_dimensions[letra].width = ancho
     wb.save(ruta)
 
 
@@ -255,19 +388,51 @@ def _norm(s):
     return re.sub(r"[^a-z]", "", s)
 
 
+def _dias_de(texto):
+    nombres = {_norm(n): i for i, n in enumerate(DIAS)}
+    return [nombres[_norm(x)] for x in str(texto or "").split(",") if _norm(x) in nombres]
+
+
 def _leer_calendario(wb):
+    """Devuelve Calendarios (base + recursos) o None si el libro no trae hoja «Calendario»."""
     if "Calendario" not in wb.sheetnames:
         return None
-    ws = wb["Calendario"]
-    filas = list(ws.iter_rows(values_only=True))
+    filas = list(wb["Calendario"].iter_rows(values_only=True))
     try:
         horas = float(filas[0][1])
-        nombres = {_norm(n): i for i, n in enumerate(DIAS)}
-        dias = [nombres[_norm(x)] for x in str(filas[1][1]).split(",") if _norm(x) in nombres]
-        libres = [(parse_fecha(r[0]), str(r[1] or "")) for r in filas[4:] if r and r[0]]
-        return Calendario(horas, dias, libres)
+        dias = _dias_de(filas[1][1])
+        ciclo = None
+        if len(filas) > 2 and filas[2][1] and str(filas[2][0]).startswith("Ciclo"):
+            n, m, f = str(filas[2][1]).split(";")
+            ciclo = (int(n), int(m), parse_fecha(f))
+        libres = [(parse_fecha(r[0]), str(r[1] or "")) for r in filas[3:] if r and r[0] and _es_fecha_txt(r[0])]
+        base = Calendario(horas, dias, libres, ciclo)
     except (IndexError, TypeError, ValueError):
         return None
+    recursos = {}
+    if "Calendarios_Recursos" in wb.sheetnames:
+        own = {}
+        if "Libres_Recursos" in wb.sheetnames:
+            for r in list(wb["Libres_Recursos"].iter_rows(values_only=True))[1:]:
+                if r and r[0] and r[1]:
+                    own.setdefault(str(r[0]).strip(), []).append((parse_fecha(r[1]), str(r[2] or "")))
+        for r in list(wb["Calendarios_Recursos"].iter_rows(values_only=True))[1:]:
+            if not (r and r[0]):
+                continue
+            try:
+                ciclo = (int(r[3]), int(r[4] or 0), parse_fecha(r[5])) if r[3] else None
+                recursos[str(r[0]).strip()] = Calendario(float(r[1] or base.horas), _dias_de(r[2]) or base.dias,
+                                                         own.get(str(r[0]).strip(), []), ciclo)
+            except (TypeError, ValueError):
+                continue
+    return Calendarios(base, recursos)
+
+
+def _es_fecha_txt(v):
+    try:
+        return parse_fecha(v) is not None
+    except ValueError:
+        return False
 
 
 def leer_excel(ruta):
@@ -294,7 +459,7 @@ def leer_excel(ruta):
     if "dur" not in idx and "fin" not in idx:
         raise ValueError("Falta la columna «Dur (días háb.)» o «Fin».")
     g = lambda r, k: r[idx[k]] if k in idx and idx[k] < len(r) else None
-    base = cal or Calendario()
+    base = cal or Calendarios()
     tareas = []
     for r in filas[1:]:
         id_ = str(g(r, "id") or "").strip()
@@ -430,7 +595,7 @@ def leer_project(ruta):
         if mejor is None or ok > mejor[0]:
             mejor = (ok, dias)
     h = sorted(razones)[len(razones) // 2] if razones else 8.0
-    cal = Calendario(h, mejor[1])
+    cal = Calendarios(Calendario(h, mejor[1]))
     avisos = [f"Importadas {len(tareas)} tareas desde Project ({len(hojas)} con trabajo propio, "
               f"{len(tareas) - len(hojas)} resúmenes).",
               f"Calendario inferido: {cal.resumen()} — coinciden {mejor[0]} de {len(hojas)} fechas de fin; "
@@ -486,6 +651,13 @@ def guardar_project(tareas, cal, ruta):
     for letra, ancho in zip("ABCDEFGH", (16, 14, 60, 10, 12, 12, 14, 22)):
         ws.column_dimensions[letra].width = ancho
     wb.save(ruta)
+
+
+def ejemplo_calendario(hoy=None):
+    """Calendario FICTICIO para el ejemplo: planta 12 h todos los días; «Mantención» en ciclo 4x3."""
+    h = hoy or dt.date.today()
+    h = h - dt.timedelta(days=h.weekday() + 7)
+    return Calendarios(Calendario(12, range(7)), {"Mantención": Calendario(12, (), (), (4, 3, h))})
 
 
 def ejemplo(hoy=None):
