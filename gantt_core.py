@@ -41,6 +41,12 @@ class Calendario:
 
     es_habil = trabaja
 
+    @property
+    def base(self):                 # un Calendario suelto se comporta como Calendarios sin recursos
+        return self
+
+    recursos = {}
+
     def de(self, t=None):
         return self
 
